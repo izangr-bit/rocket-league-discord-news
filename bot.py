@@ -1,102 +1,52 @@
 
 import json
 import os
-import re
 import urllib.request
-from html.parser import HTMLParser
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
-NEWS_URL = "https://www.rocketleague.com/news"
+RSS_URL = "https://steamcommunity.com/games/252950/rss"
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = Path("seen_news.json")
-BASE_URL = "https://www.rocketleague.com"
-
-
-class NewsParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.articles = []
-        self.current_url = None
-        self.current_title = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag != "a":
-            return
-
-        attrs = dict(attrs)
-        href = attrs.get("href", "")
-
-        if not href:
-            return
-
-        url = urljoin(BASE_URL, href)
-        parsed = urlparse(url)
-
-        if (
-            parsed.netloc == "www.rocketleague.com"
-            and parsed.path.startswith("/news/")
-            and parsed.path.rstrip("/") != "/news"
-        ):
-            self.current_url = url.split("#")[0].split("?")[0]
-            self.current_title = []
-
-    def handle_data(self, data):
-        if self.current_url:
-            self.current_title.append(data.strip())
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self.current_url:
-            title = " ".join(
-                part for part in self.current_title if part
-            )
-            title = re.sub(r"\s+", " ", title).strip()
-
-            if title and len(title) > 3:
-                self.articles.append({
-                    "title": title[:250],
-                    "url": self.current_url
-                })
-
-            self.current_url = None
-            self.current_title = []
 
 
 def get_news():
     request = urllib.request.Request(
-        NEWS_URL,
-        headers={"User-Agent": "RocketLeagueNewsDiscord/1.0"}
+        RSS_URL,
+        headers={"User-Agent": "RocketLeagueDiscordNews/1.0"}
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
-        html = response.read().decode("utf-8", errors="replace")
+        xml_data = response.read()
 
-    parser = NewsParser()
-    parser.feed(html)
+    root = ET.fromstring(xml_data)
+    articles = []
 
-    unique = []
-    seen = set()
+    for item in root.findall(".//item"):
+        title = item.findtext("title", "").strip()
+        link = item.findtext("link", "").strip()
 
-    for article in parser.articles:
-        if article["url"] not in seen:
-            seen.add(article["url"])
-            unique.append(article)
+        if title and link:
+            articles.append({
+                "title": title[:240],
+                "url": link
+            })
 
-    return unique
+    return articles
 
 
 def send_to_discord(article):
     payload = {
         "username": "Rocket League News",
         "embeds": [{
-            "title": "🚗 " + article["title"][:240],
+            "title": "🚗 " + article["title"],
             "url": article["url"],
             "description": (
-                "¡Hay una nueva noticia de Rocket League!\n\n"
-                "[Leer noticia completa](" + article["url"] + ")"
+                "¡Nueva noticia o anuncio de Rocket League!\n\n"
+                f"[Leer noticia completa]({article['url']})"
             ),
             "color": 16747520,
-            "footer": {"text": "Fuente oficial: Rocket League"}
+            "footer": {"text": "Fuente: noticias de Steam"}
         }],
         "allowed_mentions": {"parse": []}
     }
@@ -112,7 +62,7 @@ def send_to_discord(article):
     with urllib.request.urlopen(request, timeout=30) as response:
         if response.status not in (200, 204):
             raise RuntimeError(
-                f"Discord respondió con código {response.status}"
+                f"Discord devolvió el código {response.status}"
             )
 
 
@@ -121,43 +71,57 @@ def main():
 
     if not articles:
         raise RuntimeError(
-            "No se encontraron noticias. Revisa si cambió la web oficial."
+            "El RSS no devolvió noticias. Revisa el feed."
         )
 
     old_urls = set()
 
     if STATE_FILE.exists():
-        old_urls = set(json.loads(STATE_FILE.read_text("utf-8")))
-
-    current_urls = [article["url"] for article in articles]
-
-    if not STATE_FILE.exists():
-        STATE_FILE.write_text(
-            json.dumps(current_urls, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+        old_urls = set(
+            json.loads(STATE_FILE.read_text(encoding="utf-8"))
         )
-        print(f"Primera ejecución: guardadas {len(current_urls)} noticias.")
-        return
 
     new_articles = [
         article for article in articles
         if article["url"] not in old_urls
     ]
 
-    # Guardar también los enlaces actuales para no repetirlos.
+    # Primera ejecución: registrar las noticias actuales
+    # sin publicar mensajes antiguos.
+    if not STATE_FILE.exists():
+        STATE_FILE.write_text(
+            json.dumps(
+                [article["url"] for article in articles],
+                ensure_ascii=False,
+                indent=2
+            ),
+            encoding="utf-8"
+        )
+        print(f"Inicio correcto: registradas {len(articles)} noticias.")
+        return
+
+    # Publicar primero las más antiguas de las nuevas.
+    to_send = list(reversed(new_articles))[:5]
+    published = []
+
+    for article in to_send:
+        send_to_discord(article)
+        published.append(article["url"])
+        print("Publicado:", article["title"])
+
+    # Marcar como vistas únicamente las publicadas.
+    updated_urls = list(old_urls) + published
+
     STATE_FILE.write_text(
         json.dumps(
-            list(dict.fromkeys(current_urls + list(old_urls))),
+            list(dict.fromkeys(updated_urls)),
             ensure_ascii=False,
             indent=2
         ),
         encoding="utf-8"
     )
 
-    # Limitar publicaciones por ejecución para evitar spam.
-    for article in reversed(new_articles[:5]):
-        send_to_discord(article)
-        print("Publicado:", article["title"])
+    print(f"Comprobación terminada. Publicadas: {len(published)}")
 
 
 if __name__ == "__main__":
