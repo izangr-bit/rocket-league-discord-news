@@ -2,6 +2,7 @@
 import json
 import os
 import urllib.request
+import urllib.error
 
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 
@@ -29,22 +30,40 @@ def send_test_message():
     data = json.dumps(payload).encode("utf-8")
 
     request = urllib.request.Request(
-        WEBHOOK_URL,
+        WEBHOOK_URL.strip(),
         data=data,
         headers={
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "RocketLeagueNewsBot/1.0"
         },
         method="POST"
     )
 
-    with urllib.request.urlopen(request, timeout=30) as response:
-        if response.status not in (200, 204):
-            raise RuntimeError(
-                f"Discord respondió con el código {response.status}"
-            )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            print(f"Respuesta de Discord: HTTP {response.status}")
 
-    print("¡Prueba enviada correctamente a Discord!")
+            if response.status not in (200, 204):
+                raise RuntimeError("Discord no aceptó el mensaje.")
+
+        print("¡Prueba enviada correctamente a Discord!")
+
+    except urllib.error.HTTPError as error:
+        print(f"Discord ha respondido con HTTP {error.code}.")
+        print("Detalle:", error.read().decode("utf-8", errors="replace"))
+        raise
+
+    except urllib.error.URLError as error:
+        print("No se pudo conectar con Discord.")
+        print("Detalle:", error.reason)
+        raise
 
 
 if __name__ == "__main__":
+    if not WEBHOOK_URL.startswith("https://discord.com/api/webhooks/"):
+        raise ValueError(
+            "Revisa DISCORD_WEBHOOK_URL: debe ser la URL de un "
+            "webhook de Discord."
+        )
+
     send_test_message()
