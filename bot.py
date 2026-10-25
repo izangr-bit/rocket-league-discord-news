@@ -5,19 +5,32 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote
 
-# CONFIGURACIÓN
-RSS_URL = "https://steamcommunity.com/games/252950/rss"
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 STATE_FILE = Path("seen_news.json")
 MAX_POSTS_PER_RUN = 5
 
+FEEDS = {
+    "steam": "https://steamcommunity.com/games/252950/rss",
+    "oficial": (
+        "https://news.google.com/rss/search?q="
+        + quote("site:rocketleague.com/news")
+        + "&hl=en-US&gl=US&ceid=US:en"
+    ),
+    "competitivo": (
+        "https://news.google.com/rss/search?q="
+        + quote("site:rocketleague.com/news RLCS OR esports")
+        + "&hl=en-US&gl=US&ceid=US:en"
+    ),
+}
 
-def get_news():
-    """Descarga los anuncios disponibles en el feed RSS."""
+
+def fetch_feed(source, url):
+    """Lee un feed RSS y devuelve sus noticias."""
     request = urllib.request.Request(
-        RSS_URL,
-        headers={"User-Agent": "RocketLeagueNewsDiscord/1.0"}
+        url,
+        headers={"User-Agent": "RocketLeagueNewsBot/1.0"}
     )
 
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -25,52 +38,55 @@ def get_news():
 
     root = ET.fromstring(xml_data)
     articles = []
-    found = set()
+    used_urls = set()
 
     for item in root.findall(".//item"):
         title = (item.findtext("title") or "").strip()
         link = (item.findtext("link") or "").strip()
-        description = (item.findtext("description") or "").strip()
 
-        if not title or not link or link in found:
+        if not title or not link or link in used_urls:
             continue
 
-        found.add(link)
+        used_urls.add(link)
         articles.append({
             "title": title[:240],
             "url": link,
-            "description": description
+            "source": source
         })
 
     return articles
 
 
 def send_to_discord(article):
-    """Envía un anuncio al webhook de Discord."""
-    description = (
-        "¡Nueva noticia o anuncio de Rocket League!\n\n"
-        f"[Leer noticia completa]({article['url']})"
-    )
+    """Publica una noticia en Discord."""
+    source_names = {
+        "steam": "Anuncios de Steam",
+        "oficial": "Noticias oficiales de Rocket League",
+        "competitivo": "Rocket League: competitivo"
+    }
 
     payload = {
         "username": "Rocket League News",
         "embeds": [{
-            "title": "🚗 " + article["title"],
+            "title": "🚗 " + article["title"][:240],
             "url": article["url"],
-            "description": description,
+            "description": (
+                "¡Nueva noticia de Rocket League!\n\n"
+                f"[Leer noticia completa]({article['url']})"
+            ),
             "color": 16747520,
             "footer": {
-                "text": "Fuente: noticias de Steam"
+                "text": source_names.get(
+                    article["source"], "Noticias de Rocket League"
+                )
             }
         }],
         "allowed_mentions": {"parse": []}
     }
 
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
     request = urllib.request.Request(
         WEBHOOK_URL,
-        data=data,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST"
     )
@@ -88,77 +104,111 @@ def send_to_discord(article):
         ) from error
 
 
-def load_seen():
-    """Carga las URL registradas anteriormente."""
+def load_state():
+    """Carga el historial y permite recuperar el formato anterior."""
     if not STATE_FILE.exists():
-        return None
+        return {"seen": {}, "initialized": {}}
 
     data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
 
-    if not isinstance(data, list):
-        raise ValueError("seen_news.json no contiene una lista válida.")
+    # Compatibilidad con el historial anterior, que era una lista.
+    if isinstance(data, list):
+        return {
+            "seen": {"steam": data},
+            "initialized": {"steam": True}
+        }
 
-    return set(data)
+    if not isinstance(data, dict):
+        raise ValueError("El archivo de historial no tiene un formato válido.")
+
+    data.setdefault("seen", {})
+    data.setdefault("initialized", {})
+    return data
 
 
-def save_seen(urls):
-    """Guarda las URL conocidas."""
+def save_state(state):
     STATE_FILE.write_text(
-        json.dumps(sorted(urls), ensure_ascii=False, indent=2),
+        json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
 
 
 def main():
-    articles = get_news()
+    state = load_state()
+    seen = state["seen"]
+    initialized = state["initialized"]
 
-    if not articles:
+    articles_to_publish = []
+    successful_feeds = 0
+
+    for source, url in FEEDS.items():
+        try:
+            articles = fetch_feed(source, url)
+            successful_feeds += 1
+            old_urls = set(seen.get(source, []))
+            current_urls = {article["url"] for article in articles}
+
+            # La primera vez de cada fuente, guardar su estado inicial.
+            if not initialized.get(source, False):
+                seen[source] = list(current_urls)
+                initialized[source] = True
+                print(
+                    f"{source}: registradas {len(articles)} noticias "
+                    "iniciales, sin publicarlas."
+                )
+                continue
+
+            new_articles = [
+                article for article in articles
+                if article["url"] not in old_urls
+            ]
+
+            articles_to_publish.extend(new_articles)
+
+            print(
+                f"{source}: {len(articles)} noticias revisadas; "
+                f"{len(new_articles)} nuevas."
+            )
+
+        except Exception as error:
+            print(f"AVISO: no se pudo leer la fuente {source}: {error}")
+
+    if successful_feeds == 0:
         raise RuntimeError(
-            "El feed RSS no devolvió noticias. No se ha modificado el registro."
+            "No se pudo leer ninguna fuente RSS. "
+            "Se conserva el historial para volver a intentarlo."
         )
 
-    old_urls = load_seen()
-    current_urls = {article["url"] for article in articles}
+    # Evitar publicar dos veces el mismo enlace.
+    unique_articles = []
+    found_urls = set()
 
-    # Primera ejecución: guardar el estado inicial sin publicar
-    # todos los anuncios antiguos.
-    if old_urls is None:
-        save_seen(current_urls)
-        print(
-            f"Primera ejecución: registradas {len(current_urls)} noticias. "
-            "No se publicaron anuncios antiguos."
-        )
-        return
+    for article in articles_to_publish:
+        if article["url"] not in found_urls:
+            found_urls.add(article["url"])
+            unique_articles.append(article)
 
-    new_articles = [
-        article for article in articles
-        if article["url"] not in old_urls
-    ]
+    # Publicar como máximo cinco novedades en cada ejecución.
+    to_publish = list(reversed(unique_articles))[:MAX_POSTS_PER_RUN]
 
-    if not new_articles:
-        print(
-            f"Comprobación terminada: {len(articles)} anuncios revisados. "
-            "No hay noticias nuevas."
-        )
-        return
+    published_by_source = {}
 
-    # El feed suele mostrar primero lo más reciente.
-    # Publicamos primero las más antiguas de las novedades detectadas.
-    to_send = list(reversed(new_articles))[:MAX_POSTS_PER_RUN]
-    successfully_sent = set()
-
-    for article in to_send:
+    for article in to_publish:
         send_to_discord(article)
-        successfully_sent.add(article["url"])
-        print("Publicado correctamente:", article["title"])
+        published_by_source.setdefault(article["source"], []).append(
+            article["url"]
+        )
+        print("Publicado:", article["title"])
 
-    # Solo registrar como vistas las noticias que se han enviado.
-    # Si falla Discord, el workflow termina con error y podrá reintentarse.
-    save_seen(old_urls | successfully_sent)
+    # Registrar únicamente los anuncios enviados correctamente.
+    for source, urls in published_by_source.items():
+        previous = set(seen.get(source, []))
+        seen[source] = list(previous | set(urls))
+
+    save_state(state)
 
     print(
-        f"Comprobación terminada: {len(articles)} anuncios revisados; "
-        f"{len(successfully_sent)} publicados."
+        f"Proceso terminado. Noticias publicadas: {len(to_publish)}."
     )
 
 
@@ -166,8 +216,6 @@ if __name__ == "__main__":
     if not WEBHOOK_URL.startswith(
         "https://discord.com/api/webhooks/"
     ):
-        raise ValueError(
-            "DISCORD_WEBHOOK_URL no parece una URL válida de Discord."
-        )
+        raise ValueError("Revisa el secreto DISCORD_WEBHOOK_URL.")
 
     main()
